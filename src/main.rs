@@ -1,3 +1,4 @@
+use cgmath::prelude::*;
 use pollster::FutureExt;
 use std::borrow::Borrow;
 use std::sync::Arc;
@@ -10,7 +11,9 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::KeyCode;
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
+
 mod texture;
+
 pub async fn run() {
     let event_loop = EventLoop::new().unwrap();
 
@@ -22,7 +25,63 @@ pub async fn run() {
 //
 // unsafe impl bytemuck::Pod for Vertex {}
 // unsafe impl bytemuck::Zeroable for Vertex {}
-//
+struct MyInstance {
+    position: cgmath::Vector3<f32>,
+    rotation: cgmath::Quaternion<f32>,
+}
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct InstanceRaw {
+    model: [[f32; 4]; 4],
+}
+impl MyInstance {
+    fn to_raw(&self) -> InstanceRaw {
+        InstanceRaw {
+            model: (cgmath::Matrix4::from_translation(self.position)
+                * cgmath::Matrix4::from(self.rotation))
+            .into(),
+        }
+    }
+}
+impl InstanceRaw {
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        use std::mem;
+        wgpu::VertexBufferLayout {
+            array_stride: mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
+            // We need to switch from using a step mode of Vertex to Instance
+            // This means that our shaders will only change to use the next
+            // instance when the shader starts processing a new instance
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[
+                // A mat4 takes up 4 vertex slots as it is technically 4 vec4s. We need to define a slot
+                // for each vec4. We'll have to reassemble the mat4 in the shader.
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    // While our vertex shader only uses locations 0, and 1 now, in later tutorials, we'll
+                    // be using 2, 3, and 4, for Vertex. We'll start at slot 5, not conflict with them later
+                    shader_location: 5,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
+                    shader_location: 6,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
+                    shader_location: 7,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 12]>() as wgpu::BufferAddress,
+                    shader_location: 8,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+        }
+    }
+}
+
 struct Camera {
     eye: cgmath::Point3<f32>,
     target: cgmath::Point3<f32>,
@@ -309,6 +368,8 @@ struct State<'a> {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     camera_controller: CameraController,
+    Myinstances: Vec<MyInstance>,
+    instance_buffer: wgpu::Buffer,
 }
 
 impl<'a> State<'a> {
@@ -344,7 +405,18 @@ impl<'a> State<'a> {
         let camera_bind_group =
             Self::create_camera_bind_group(&device, &camera_bind_group_layout, &camera_buffer);
 
+        // copilot help me here
+        let instance_data = Self::generate_instances(10, cgmath::Vector3::new(5.0, 0.0, 5.0))
+            .iter()
+            .map(MyInstance::to_raw)
+            .collect::<Vec<_>>();
+        let Myinstances = Self::generate_instances(10, cgmath::Vector3::new(5.0, 0.0, 5.0));
+        let instance_buffer =
+            Self::create_instance_buffer(&device, &instance_data, Some("Instance Buffer"));
+
         Self {
+            Myinstances,
+            instance_buffer,
             camera_uniform,
             camera,
             camera_buffer,
@@ -364,6 +436,48 @@ impl<'a> State<'a> {
             window: window_arc,
         }
     }
+
+    fn create_instance_buffer(
+        device: &wgpu::Device,
+        instance_data: &Vec<InstanceRaw>,
+        label: Option<&str>,
+    ) -> wgpu::Buffer {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label,
+            contents: bytemuck::cast_slice(&instance_data),
+            usage: wgpu::BufferUsages::VERTEX,
+        })
+    }
+
+    fn generate_instances(
+        num_instances_per_row: usize,
+        instance_displacement: cgmath::Vector3<f32>,
+    ) -> Vec<MyInstance> {
+        (0..num_instances_per_row)
+            .flat_map(|z| {
+                (0..num_instances_per_row).map(move |x| {
+                    let position = cgmath::Vector3 {
+                        x: x as f32,
+                        y: 0.0,
+                        z: z as f32,
+                    } - instance_displacement;
+
+                    let rotation = if position.is_zero() {
+                        // Avoid scaling to zero for an object at (0, 0, 0)
+                        cgmath::Quaternion::from_axis_angle(
+                            cgmath::Vector3::unit_z(),
+                            cgmath::Deg(0.0),
+                        )
+                    } else {
+                        cgmath::Quaternion::from_axis_angle(position.normalize(), cgmath::Deg(45.0))
+                    };
+
+                    MyInstance { position, rotation }
+                })
+            })
+            .collect::<Vec<_>>()
+    }
+
     fn create_camera_controller(sensitivity: f32) -> CameraController {
         CameraController::new(sensitivity)
     }
@@ -509,7 +623,7 @@ impl<'a> State<'a> {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Vertex::desc()],
+                buffers: &[Vertex::desc(), InstanceRaw::desc()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -666,13 +780,19 @@ impl<'a> State<'a> {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-
+            // this part took me upto 4:15 am to debug, dont forget to update these , good night , rust
+            // analyzer is good but it needs a lot of memory more than browsers it is heating up my
+            // laptop my cpu uptime is 7+ hours i didnt realise i was working continuosly 7 hours
+            // on shit like this and my own language probabaly my language will fix these problem
+            // of writing 10000+ lines of code to do simple things, gunn nite :)
             _render_pass.set_pipeline(&self.render_pipeline);
             _render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
             _render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
-            _render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            _render_pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+            _render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             _render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            _render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+            //            _render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+            _render_pass.draw_indexed(0..self.num_indices, 0, 0..self.Myinstances.len() as _);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
