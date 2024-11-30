@@ -9,7 +9,7 @@ use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
-
+mod texture;
 pub async fn run() {
     let event_loop = EventLoop::new().unwrap();
 
@@ -26,12 +26,13 @@ pub async fn run() {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
     position: [f32; 3],
-    color: [f32; 3],
+    tex_coords: [f32; 2],
 }
 impl Vertex {
     fn desc() -> wgpu::VertexBufferLayout<'static> {
+        use std::mem;
         wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            array_stride: mem::size_of::<Vertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
                 wgpu::VertexAttribute {
@@ -40,9 +41,9 @@ impl Vertex {
                     format: wgpu::VertexFormat::Float32x3,
                 },
                 wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    offset: mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                     shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x3,
+                    format: wgpu::VertexFormat::Float32x2,
                 },
             ],
         }
@@ -51,18 +52,31 @@ impl Vertex {
 const VERTICES: &[Vertex] = &[
     Vertex {
         position: [0.0, 0.5, 0.0],
-        color: [1.0, 0.0, 0.0],
+        tex_coords: [0.5, 0.0],
     },
     Vertex {
         position: [-0.5, -0.5, 0.0],
-        color: [0.0, 1.0, 0.0],
+        tex_coords: [0.0, 1.0],
     },
     Vertex {
         position: [0.5, -0.5, 0.0],
-        color: [0.0, 0.0, 1.0],
+        tex_coords: [1.0, 1.0],
+    },
+    Vertex {
+        position: [-0.25, 0.0, 0.0],
+        tex_coords: [0.1, 0.5],
+    },
+    Vertex {
+        position: [0.25, 0.0, 0.0],
+        tex_coords: [0.9, 0.5],
+    },
+    Vertex {
+        position: [0.0, 0.0, 0.0],
+        tex_coords: [0.5, 0.5],
     },
 ];
-const INDICES: &[u16] = &[0, 1, 2];
+
+const INDICES: &[u16] = &[0, 1, 2, 3, 4, 5];
 
 struct StateApplication<'a> {
     state: Option<State<'a>>,
@@ -124,6 +138,8 @@ struct State<'a> {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
+    diffuse_texture: texture::Texture,
+    diffuse_bind_group: wgpu::BindGroup,
 }
 
 impl<'a> State<'a> {
@@ -141,7 +157,20 @@ impl<'a> State<'a> {
         let index_buffer = Self::create_index_buffer(&device);
         let num_indices = INDICES.len() as u32;
 
+        let diffuse_texture = texture::Texture::from_bytes(
+            &device,
+            &queue,
+            include_bytes!("../happy-tree.png"),
+            "happy-tree.png",
+        )
+        .unwrap();
+        let layout = Self::create_texture_bind_group_layout(&device);
+        let diffuse_bind_group =
+            Self::create_diffuse_bind_group(&device, &layout, &diffuse_texture);
+
         Self {
+            diffuse_texture,
+            diffuse_bind_group,
             vertex_buffer,
             index_buffer,
             num_indices,
@@ -153,6 +182,51 @@ impl<'a> State<'a> {
             size,
             window: window_arc,
         }
+    }
+
+    fn create_texture_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+            label: Some("texture_bind_group_layout"),
+        })
+    }
+
+    fn create_diffuse_bind_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        diffuse_texture: &texture::Texture,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&diffuse_texture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&diffuse_texture.sampler),
+                },
+            ],
+            label: Some("diffuse_bind_group"),
+        })
     }
 
     fn create_vertex_buffer(device: &wgpu::Device) -> wgpu::Buffer {
@@ -182,7 +256,7 @@ impl<'a> State<'a> {
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[],
+                bind_group_layouts: &[&(Self::create_texture_bind_group_layout(&device))],
                 push_constant_ranges: &[],
             });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -340,6 +414,7 @@ impl<'a> State<'a> {
             });
 
             _render_pass.set_pipeline(&self.render_pipeline);
+            _render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
             _render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             _render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             _render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
