@@ -1,0 +1,13 @@
+[package]
+name = "eyengine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.93"
+bytemuck = { version = "1.20.0", features = ["derive"] }
+pollster = "0.4.0"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+wgpu = "23.0.0"
+winit = "0.30.5"
